@@ -1,0 +1,643 @@
+# Import the required packages
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from sklearn.metrics import  mean_squared_error, median_absolute_error
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression, ElasticNet
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+import xgboost as xgb
+from sklearn.model_selection import GridSearchCV
+import shap
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.covariance import MinCovDet
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import RobustScaler
+from sklearn.linear_model import ElasticNetCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+import matplotlib.pyplot as plt
+import numpy as np
+import shap
+
+ordinal_categories = {
+    'buildingCondition': ['TO_REBUILD', 'TO_RENOVATE', 'TO_REFURBISH', 
+                           'RENOVATED', 'GOOD', 'AS_NEW', 'NEWBUILD'],
+    'floodProneLocation': ['no', 'possible', 'yes'],
+    # Add other ordinal columns here as needed
+}
+
+
+def feature_engineering(housesdata):
+    ########################## FEATURE ENGINEERING ############################
+    # Change initialPrice into the log of initialPrice and drop the original column and other columns on price data
+    housesdata['logInitialPrice'] = np.log(housesdata['initialPrice'])
+    housesdata.drop(columns=['initialPrice'], inplace=True)
+    housesdata.drop(columns=['price'], inplace=True)
+
+    # NaN's per column
+    for column in housesdata.columns:
+        nans = housesdata[column].isna().sum()
+        total = len(housesdata[column])
+        percentage = (nans / total) * 100
+        print(f"{column}: {percentage:.2f}% missing values")
+
+    # Loop which removes all variables which have more missing values than a certain threshold
+    def filter_columns_by_nan_threshold(df, threshold=0.50):
+        nan_percentage = df.isna().mean()
+        columns_to_keep = nan_percentage[nan_percentage <= threshold].index
+        filtered_df = df[columns_to_keep]
+        return filtered_df
+
+    housesdata_cleaned = filter_columns_by_nan_threshold(housesdata, threshold=0.50)
+
+    housesdata_cleaned.drop(columns=['admin1Id', 'admin1', 'admin2Id', 'admin2', 'localityId', 'locality',
+                                     'subLocalityId', 'districtId', 'district', 'postalCode', 'niscode', 'region',
+                                     'addressType', 'housingType', 'secondaryHousingType', 'numberOfSides', 'way', 'Unnamed: 0',
+                                     'marker', 'address'], inplace=True)
+
+    # Create a new variable 'houseAge' which is the difference between the current year and the 'buildYear'
+    # This will have 2 benefits: variance will be higher and we lose the buildyear columns as we like to minimize dummies where possible
+    housesdata_cleaned['houseAge'] = 2025 - housesdata_cleaned['buildYear']
+    housesdata_cleaned.drop(columns=['buildYear'], inplace=True)
+
+    # Convert 'firstListing' and 'lastListing' to datetime format
+    housesdata_cleaned['firstListing'] = pd.to_datetime(housesdata_cleaned['firstListing'])
+    housesdata_cleaned['lastListing'] = pd.to_datetime(housesdata_cleaned['lastListing'])
+
+    # Create a new feature 'daysOnMarket' by calculating the difference in days between 'lastListing' and 'firstListing'
+    housesdata_cleaned['daysOnMarket'] = (housesdata_cleaned['lastListing'] - housesdata_cleaned['firstListing']).dt.days
+
+    # Drop the original 'firstListing' and 'lastListing' columns
+    housesdata_cleaned.drop(columns=['lastListing'], inplace=True)
+
+    # Extract only the year from the firstListing variable
+    housesdata_cleaned['firstListing'] = pd.to_datetime(housesdata_cleaned['firstListing'], format='%Y-%m-%d')
+    housesdata_cleaned['firstListing'] = housesdata_cleaned['firstListing'].dt.year
+    housesdata_cleaned['firstListing'] = housesdata_cleaned['firstListing'].astype(int)
+
+    return housesdata_cleaned
+
+def impute_missing_values_with_median_mode(housesdata_cleaned):
+    # Replace missing values in numerical features with the median
+    housesdata_cleaned_median_mode = housesdata_cleaned.copy()
+    numerical_columns = housesdata_cleaned_median_mode.select_dtypes(include=[np.number]).columns
+    housesdata_cleaned_median_mode[numerical_columns] = housesdata_cleaned_median_mode[numerical_columns].apply(lambda x: x.fillna(x.median()))
+
+    # Replace missing values in categorical features with the mode
+    categorical_columns = housesdata_cleaned_median_mode.select_dtypes(include=['object']).columns
+    housesdata_cleaned_median_mode[categorical_columns] = housesdata_cleaned_median_mode[categorical_columns].apply(lambda x: x.fillna(x.mode()[0]))
+
+    return housesdata_cleaned_median_mode
+
+def preprocess_data(housesdata_cleaned):
+    # Separate the dependent variable 'logInitialPrice' from the dataframe
+    logInitialPrice_df = housesdata_cleaned['logInitialPrice'].copy()
+    housesdata_cleaned = housesdata_cleaned.drop(columns=['logInitialPrice'])
+
+    # Separate ordinal and non-ordinal categorical columns
+    ordinal_categorical_columns = list(ordinal_categories.keys())
+    non_ordinal_categorical_columns = [
+        col for col in housesdata_cleaned.select_dtypes(include=['object']).columns
+        if col not in ordinal_categorical_columns]
+
+    # Replace missing values in non-ordinal categorical columns with the mode
+    for col in non_ordinal_categorical_columns:
+        mode_value = housesdata_cleaned[col].mode()[0]
+        housesdata_cleaned[col].fillna(mode_value, inplace=True)
+
+    # Encode non-ordinal categorical columns with a placeholder for missing values (-1)
+    non_ordinal_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+    housesdata_cleaned[non_ordinal_categorical_columns] = non_ordinal_encoder.fit_transform(
+        housesdata_cleaned[non_ordinal_categorical_columns].astype(str))
+
+    # Encode ordinal categorical columns
+    ordinal_encoders = {}
+    for col, categories in ordinal_categories.items():
+        encoder = OrdinalEncoder(categories=[categories], handle_unknown='use_encoded_value', unknown_value=-1)
+        housesdata_cleaned[col] = encoder.fit_transform(housesdata_cleaned[[col]].astype(str))
+        ordinal_encoders[col] = encoder  # Save the encoder for inverse transform
+
+    # Replace missing values in numerical columns with np.nan
+    numerical_columns = housesdata_cleaned.select_dtypes(include=[np.number]).columns
+    housesdata_cleaned[numerical_columns] = housesdata_cleaned[numerical_columns].apply(lambda x: x.replace('', np.nan))
+
+    # Ensure all columns are numeric
+    housesdata_cleaned[numerical_columns] = housesdata_cleaned[numerical_columns].apply(pd.to_numeric, errors='coerce')
+
+    # MICE imputation
+    mice_imputer = IterativeImputer(max_iter=500, tol=1e-3, random_state=0)
+    housesdata_cleaned_imputed = pd.DataFrame(
+        mice_imputer.fit_transform(housesdata_cleaned),
+        columns=housesdata_cleaned.columns)
+
+    # Clip and decode non-ordinal categorical columns
+    for col in non_ordinal_categorical_columns:
+        max_val = len(non_ordinal_encoder.categories_[non_ordinal_categorical_columns.index(col)]) - 1
+        # Clip the imputed values to valid ranges
+        housesdata_cleaned_imputed[col] = housesdata_cleaned_imputed[col].clip(lower=0, upper=max_val)
+
+    # Decode non-ordinal categorical columns back to original categories
+    housesdata_cleaned_imputed[non_ordinal_categorical_columns] = non_ordinal_encoder.inverse_transform(
+        housesdata_cleaned_imputed[non_ordinal_categorical_columns])
+
+    # Replace placeholder (-1) with NaN for non-ordinal columns
+    housesdata_cleaned_imputed[non_ordinal_categorical_columns] = housesdata_cleaned_imputed[
+        non_ordinal_categorical_columns
+    ].replace('-1', np.nan)
+
+    # Clip and decode ordinal categorical columns
+    for col, encoder in ordinal_encoders.items():
+        max_val = len(encoder.categories_[0]) - 1  # Use the single category list
+        # Clip the imputed values to valid ranges
+        housesdata_cleaned_imputed[col] = housesdata_cleaned_imputed[col].clip(lower=0, upper=max_val)
+        # Decode ordinal categorical columns
+        numeric_col = housesdata_cleaned_imputed[col].values.reshape(-1, 1)
+        housesdata_cleaned_imputed[col] = encoder.inverse_transform(numeric_col).ravel()
+
+    # Replace placeholder (-1) with NaN for ordinal columns
+    housesdata_cleaned_imputed[ordinal_categorical_columns] = housesdata_cleaned_imputed[
+        ordinal_categorical_columns
+    ].replace('-1', np.nan)
+
+    # Add the dependent variable 'logInitialPrice' back to the dataframe
+    housesdata_cleaned_imputed['logInitialPrice'] = logInitialPrice_df.values
+
+    # Convert 'firstListing' values to the first 4 digits
+    if 'firstListing' in housesdata_cleaned_imputed.columns:
+        housesdata_cleaned_imputed['firstListing'] = housesdata_cleaned_imputed['firstListing'].astype(str).str[:4].astype(int)
+
+    # Final preview of the cleaned and imputed dataset
+    print("Final dataset preview:")
+    print(housesdata_cleaned_imputed.head())
+
+    # Round up the values in 'hasDoubleGlass' column
+    housesdata_cleaned_imputed['hasDoubleGlass'] = housesdata_cleaned_imputed['hasDoubleGlass'].apply(lambda x: 1 if x >= 0.50 else 0)
+
+    return housesdata_cleaned_imputed
+
+def generate_polynomial_features(housesdata_cleaned_imputed):
+
+    # List all numerical features
+    numerical_features = housesdata_cleaned_imputed.select_dtypes(include=[np.number]).columns.tolist()
+    print("Numerical features:", numerical_features)
+
+    # Calculate the correlation matrix for numerical features
+    correlation_matrix = housesdata_cleaned_imputed[numerical_features].corr()
+
+    # Display the correlation matrix
+    plt.figure(figsize=(16, 12))
+    sns.heatmap(correlation_matrix, annot=True, fmt=".2f", cmap="coolwarm", cbar=True)
+    plt.title("Correlation Matrix")
+    plt.show()
+
+    # Identify highly correlated features (threshold can be adjusted)
+    threshold = 0.65
+    highly_correlated_features = set()
+    for i in range(len(correlation_matrix.columns)):
+        for j in range(i):
+            if abs(correlation_matrix.iloc[i, j]) > threshold:
+                colname = correlation_matrix.columns[i]
+                highly_correlated_features.add(colname)
+
+    print("Highly correlated features (to consider removing):")
+    print(highly_correlated_features)
+
+    # Drop the highly correlated features from the dataframe
+    housesdata_cleaned_imputed.drop(columns=['estimatedArea', 'schoolDistance', 'isNewBuild'], inplace=True)
+
+    # List of features that are going to be used for polynomial features
+    poly_features = ['habitableArea', 'numberOfBedrooms', 'numberOfToilets', 
+                     'energyConsumption', 'greenCoverage', 'cadastralIncome', 'mScore']
+
+    # Create polynomial features of degree 2 and 3 with interaction terms
+    poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=False)
+    poly_data = poly.fit_transform(housesdata_cleaned_imputed[poly_features])
+
+    # Create a DataFrame from the polynomial features
+    poly_feature_names = poly.get_feature_names_out(poly_features)
+    poly_df = pd.DataFrame(poly_data, columns=poly_feature_names, index=housesdata_cleaned_imputed.index)
+
+    # Concatenate the polynomial features with the original dataframe without dropping the original columns
+    housesdata_with_poly = pd.concat([housesdata_cleaned_imputed, poly_df], axis=1)
+    
+    return housesdata_with_poly
+
+def detect_and_remove_outliers(train_data):
+    # OUTLIER DETECTION AND REMOVAL
+
+    # MULTIVARIATE OUTLIER DETECTION AND REMOVAL
+
+    # Define the minimum covariance determinant (MCD) estimator
+    mcd = MinCovDet(support_fraction=0.75, random_state=0)
+
+    # Ensure all columns used for outlier detection contain only numeric values
+    numerical_columns_for_outlier_detection = train_data.select_dtypes(include=[np.number]).columns
+
+    # Fit the MCD estimator to the numerical features
+    mcd.fit(train_data[numerical_columns_for_outlier_detection])
+
+    # Calculate the Mahalanobis distances for each observation
+    mahalanobis_distances = mcd.mahalanobis(train_data[numerical_columns_for_outlier_detection])
+
+    # Determine the threshold for outlier detection using the chi-squared distribution
+    threshold = np.percentile(mahalanobis_distances, 97.5)
+
+    # Identify outliers
+    outliers = mahalanobis_distances > threshold
+
+    # Remove outliers from the training dataset
+    train_data_cleaned = train_data[~outliers]
+
+    # Verify the resulting dataset
+    print("Training dataset after outlier removal:")
+    print(train_data_cleaned.head())
+
+    return train_data_cleaned
+
+def perform_elastic_net(train_data, test_data, param_dist):
+    ########################## PERFORM ELASTIC NET  #############################
+
+    # Separate features (X) and target (y) for training and testing datasets
+    X_train = train_data.drop(columns=['logInitialPrice'])
+    y_train = train_data['logInitialPrice']
+
+    X_test = test_data.drop(columns=['logInitialPrice'])
+    y_test = test_data['logInitialPrice']
+
+    # Display shapes of the training and testing datasets for verification
+    print(f"X_train shape: {X_train.shape}")
+    print(f"y_train shape: {y_train.shape}")
+    print(f"X_test shape: {X_test.shape}")
+    print(f"y_test shape: {y_test.shape}")
+
+    # Check for non-numeric columns in X_train
+    categorical_columns = X_train.select_dtypes(include=['object']).columns
+    print("Categorical columns:", categorical_columns)
+
+    # Define ordinal categories (update these based on your dataset)
+    ordinal_categories = {
+        'buildingCondition': ['TO_REBUILD', 'TO_RENOVATE', 'TO_REFURBISH', 'RENOVATED', 'GOOD', 'AS_NEW', 'NEWBUILD'],
+        'floodProneLocation': ['no', 'possible', 'yes'],
+    }
+
+    # Apply OrdinalEncoder to ordinal columns
+    ordinal_encoders = {}
+    for col, categories in ordinal_categories.items():
+        encoder = OrdinalEncoder(categories=[categories], handle_unknown='use_encoded_value', unknown_value=-1)
+        X_train[col] = encoder.fit_transform(X_train[[col]].astype(str))
+        X_test[col] = encoder.transform(X_test[[col]].astype(str))
+        ordinal_encoders[col] = encoder  # Save encoders for inverse transform if needed
+
+    # Identify non-ordinal categorical columns
+    non_ordinal_columns = ['subLocality', 'detachment', 'heatingType']
+
+    # Apply OrdinalEncoder to non-ordinal columns
+    non_ordinal_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+    X_train[non_ordinal_columns] = non_ordinal_encoder.fit_transform(X_train[non_ordinal_columns].astype(str))
+    X_test[non_ordinal_columns] = non_ordinal_encoder.transform(X_test[non_ordinal_columns].astype(str))
+
+    print(X_train.dtypes)
+    print(X_test.dtypes)
+
+    # Initialize the scaler
+    scaler = RobustScaler()
+
+    # Scale the training and testing features
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Optional: Convert back to DataFrame for interpretability
+    X_train_scaled = pd.DataFrame(X_train_scaled, columns=X_train.columns, index=X_train.index)
+    X_test_scaled = pd.DataFrame(X_test_scaled, columns=X_test.columns, index=X_test.index)
+
+    # Initialize the ElasticNet model
+    elastic_net = ElasticNet(random_state=42)
+
+    # Initialize RandomizedSearchCV
+    random_search = RandomizedSearchCV(
+        estimator=elastic_net,
+        param_distributions=param_dist,
+        n_iter=50,
+        scoring='neg_mean_absolute_error',
+        cv=5,
+        verbose=1,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    # Initialize the ElasticNet model
+    elastic_net = ElasticNet(random_state=42)
+
+    # Initialize RandomizedSearchCV
+    random_search = RandomizedSearchCV(
+        estimator=elastic_net,
+        param_distributions=param_dist,
+        n_iter=50,
+        scoring='neg_mean_absolute_error',
+        cv=5,
+        verbose=1,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    # Fit RandomizedSearchCV on the training data
+    random_search.fit(X_train_scaled, y_train)
+
+    # Retrieve the best model and fit it on the training data
+    best_elastic_net = random_search.best_estimator_
+    best_elastic_net.fit(X_train_scaled, y_train)
+
+    # Make predictions on the test set
+    y_pred = best_elastic_net.predict(X_test_scaled)
+    # Report the best L1 ratio and alpha
+    best_l1_ratio = random_search.best_params_['l1_ratio']
+    best_alpha = random_search.best_params_['alpha']
+    print(f"Best L1 Ratio: {best_l1_ratio}")
+    print(f"Best Alpha: {best_alpha}")
+
+    # Evaluate the model
+    mae = mean_absolute_error(y_test, y_pred)
+    mse = mean_squared_error(y_test, y_pred)
+
+    # Display performance metrics
+    print("Elastic Net Performance:")
+    print(f"Mean Absolute Error (MAE): {mae:.4f}")
+    print(f"Mean Squared Error (MSE): {mse:.4f}")
+
+    # Coefficients and Intercept
+    print("\nElastic Net Coefficients:")
+    print(best_elastic_net.coef_)
+    print(f"Intercept: {best_elastic_net.intercept_:.4f}")
+
+    # Visualize predictions vs true values
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_test, y_pred, alpha=0.6)
+    plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], color='red', linestyle='--')
+    plt.xlabel("True Values")
+    plt.ylabel("Predicted Values")
+    plt.title("Elastic Net Predictions vs True Values")
+    plt.show()
+
+    return best_elastic_net, mae, mse, y_pred, X_train, y_train, X_test, y_test
+
+def perform_elastic_net_with_feature_selection(elastic_net, X_train, y_train, X_test, y_test, param_dist, threshold=0.01):
+    # Get feature importance (coefficients)
+    coefficients = pd.Series(elastic_net.coef_, index=X_train.columns)
+    print(coefficients.sort_values(ascending=False))
+
+    # Set a threshold for removing features
+    important_features = coefficients[coefficients.abs() > threshold].index
+
+    # Filter the dataset to keep only important features
+    X_train_reduced = X_train[important_features]
+    X_test_reduced = X_test[important_features]
+
+    print(f"Reduced feature set: {len(important_features)} features")
+
+
+    # Initialize the ElasticNet model
+    elastic_net = ElasticNet(random_state=42)
+
+    # Initialize RandomizedSearchCV
+    random_search = RandomizedSearchCV(
+        estimator=elastic_net,
+        param_distributions=param_dist,
+        n_iter=50,
+        scoring='neg_mean_absolute_error',
+        cv=5,
+        verbose=1,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    # Fit RandomizedSearchCV on the reduced training data
+    # Ensure all input data is numeric and does not contain NaNs
+    X_train_reduced = X_train_reduced.apply(pd.to_numeric, errors='coerce').fillna(0)
+    y_train = pd.to_numeric(y_train, errors='coerce').fillna(0)
+    
+    random_search.fit(X_train_reduced, y_train)
+
+    # Retrieve the best model
+    elastic_net_reduced = random_search.best_estimator_
+
+    # Report the best L1 ratio and alpha
+    best_l1_ratio = random_search.best_params_['l1_ratio']
+    best_alpha = random_search.best_params_['alpha']
+    print(f"Best L1 Ratio: {best_l1_ratio}")
+    print(f"Best Alpha: {best_alpha}")
+
+    # Make predictions on the test set
+    y_pred_reduced = elastic_net_reduced.predict(X_test_reduced)
+
+    # Evaluate the model
+    mae_reduced = mean_absolute_error(y_test, y_pred_reduced)
+    mse_reduced = mean_squared_error(y_test, y_pred_reduced)
+
+    # Display performance metrics
+    print("Elastic Net Performance on Reduced Features:")
+    print(f"Mean Absolute Error (MAE): {mae_reduced:.4f}")
+    print(f"Mean Squared Error (MSE): {mse_reduced:.4f}")
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_test, y_pred_reduced, alpha=0.6)
+    plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], color='red', linestyle='--')
+    plt.xlabel("True Values")
+    plt.ylabel("Predicted Values")
+    plt.title("Elastic Net Predictions (Reduced Features) vs True Values")
+    plt.show()
+
+    return elastic_net_reduced, mae_reduced, mse_reduced, y_pred_reduced
+
+def train_xgboost_model(X_train, X_test, y_train, y_test, param_dist):
+    scaler = RobustScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Ensure y_train is one-dimensional
+    if len(y_train.shape) > 1:
+        y_train = y_train.squeeze()
+
+    # Convert to numeric arrays
+    X_train_scaled = np.asarray(X_train_scaled, dtype=float)
+    X_test_scaled = np.asarray(X_test_scaled, dtype=float)
+    y_train = np.asarray(y_train, dtype=float)
+    y_test = np.asarray(y_test, dtype=float)
+
+    # Check for NaN/Inf values in training and test sets
+    if np.any(np.isnan(X_train_scaled)) or np.any(np.isinf(X_train_scaled)):
+        raise ValueError("X_train_scaled contains NaN or Inf values.")
+    if np.any(np.isnan(y_train)) or np.any(np.isinf(y_train)):
+        raise ValueError("y_train contains NaN or Inf values.")
+    if np.any(np.isnan(X_test_scaled)) or np.any(np.isinf(X_test_scaled)):
+        raise ValueError("X_test_scaled contains NaN or Inf values.")
+
+    # Step 1: Split training data into training and validation sets
+    print("Splitting training data into training and validation sets...")
+    X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
+        X_train_scaled, y_train, test_size=0.2, random_state=42
+    )
+
+    # Step 2: Train a Baseline XGBoost Model on the Training Split
+    print("\nTraining Baseline XGBoost Model on training split...")
+    baseline_xgb = XGBRegressor(objective='reg:squarederror', random_state=42)
+    baseline_xgb.fit(X_train_split, y_train_split)
+
+    # Predict on the validation split
+    y_pred_val = baseline_xgb.predict(X_val_split)
+
+    # Evaluate the baseline model on the validation split
+    mae_val_baseline = mean_absolute_error(y_val_split, y_pred_val)
+    mse_val_baseline = mean_squared_error(y_val_split, y_pred_val)
+    print("Baseline XGBoost Model Performance (Validation Set):")
+    print(f"Mean Absolute Error (MAE): {mae_val_baseline:.4f}")
+    print(f"Mean Squared Error (MSE): {mse_val_baseline:.4f}")
+
+    # Step 3: Hyperparameter Tuning with RandomizedSearchCV
+    print("\nStarting Hyperparameter Tuning with RandomizedSearchCV...")
+    # Hyperparameter tuning
+
+
+    random_search = RandomizedSearchCV(
+        estimator=XGBRegressor(objective='reg:squarederror', random_state=42),
+        param_distributions=param_dist,
+        n_iter=50,
+        scoring='neg_mean_absolute_error',
+        cv=5,
+        verbose=1,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    # Fit RandomizedSearchCV on the training split
+    random_search.fit(X_train_split, y_train_split)
+
+    # Retrieve the best parameters and best score
+    best_params = random_search.best_params_
+    print("\nBest Parameters from RandomizedSearchCV:", best_params)
+
+    # Step 4: Train the Final Model with Best Parameters on the Full Training Data
+    print("\nTraining Final XGBoost Model with Best Parameters on full training data...")
+    final_xgb = XGBRegressor(objective='reg:squarederror', random_state=42, **best_params)
+    final_xgb.fit(X_train_scaled, y_train)
+
+    # Step 5: Evaluate the Final Model on the Test Set
+    print("\nEvaluating the Final Model on the Test Set...")
+    y_pred_test = final_xgb.predict(X_test_scaled)
+
+    # Calculate performance metrics on the test set
+    mae_test = mean_absolute_error(y_test, y_pred_test)
+    mse_test = mean_squared_error(y_test, y_pred_test)
+    print("Final XGBoost Model Performance (Test Set):")
+    print(f"Mean Absolute Error (MAE): {mae_test:.4f}")
+    print(f"Mean Squared Error (MSE): {mse_test:.4f}")
+
+    # Step 6: Visualize Predictions vs True Values
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_test, y_pred_test, alpha=0.6, label="Predictions")
+    plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], color="red", linestyle="--", label="Ideal Fit")
+    plt.xlabel("True Values")
+    plt.ylabel("Predicted Values")
+    plt.title("XGBoost Predictions vs True Values (Test Set)")
+    plt.legend()
+    plt.show()
+
+    # Step 7: Generate SHAP Explainer
+    print("\nGenerating SHAP Explainer...")
+    explainer = shap.Explainer(final_xgb, X_train_scaled)
+
+    # Step 8: Calculate SHAP Values for the Test Set
+    print("Calculating SHAP values for the test set...")
+    shap_values = explainer(X_test_scaled)
+
+    # Step 9: Plot SHAP Summary
+    print("Plotting SHAP summary plot...")
+    shap.summary_plot(shap_values, X_test_scaled, feature_names=X_train.columns)
+
+    # Step 10: Plot SHAP Bar Plot for Feature Importance
+    print("Plotting SHAP bar plot...")
+    shap.summary_plot(shap_values, X_test_scaled, feature_names=X_train.columns, plot_type="bar")
+
+    return final_xgb, mae_test, mse_test, shap_values
+
+
+
+    # Get feature importance (coefficients)
+    # Ensure the model is fitted before accessing coefficients
+    if not hasattr(best_elastic_net, 'coef_'):
+        best_elastic_net.fit(X_train, y_train)
+    
+    coefficients = pd.Series(best_elastic_net.coef_, index=X_train.columns)
+    print(coefficients.sort_values(ascending=False))
+
+    # Set a threshold for removing features
+    important_features = coefficients[coefficients.abs() > threshold].index
+
+    # Filter the dataset to keep only important features
+    X_train_reduced = X_train[important_features]
+    X_test_reduced = X_test[important_features]
+
+    print(f"Reduced feature set: {len(important_features)} features")
+
+    # Define the parameter grid for RandomizedSearchCV
+    param_dist = {
+        'alpha': [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0],
+        'l1_ratio': [0, 0.05, 0.1, 0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    }
+
+    # Initialize the ElasticNet model
+    elastic_net = ElasticNet(random_state=42)
+
+    # Initialize RandomizedSearchCV
+    random_search = RandomizedSearchCV(
+        estimator=elastic_net,
+        param_distributions=param_dist,
+        n_iter=50,
+        scoring='neg_mean_absolute_error',
+        cv=5,
+        verbose=1,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    # Fit RandomizedSearchCV on the reduced training data
+    random_search.fit(X_train_reduced, y_train)
+
+    # Retrieve the best model
+    elastic_net_reduced = random_search.best_estimator_
+
+    # Report the best L1 ratio and alpha
+    best_l1_ratio = random_search.best_params_['l1_ratio']
+    best_alpha = random_search.best_params_['alpha']
+    print(f"Best L1 Ratio: {best_l1_ratio}")
+    print(f"Best Alpha: {best_alpha}")
+
+    # Make predictions on the test set
+    y_pred_reduced = elastic_net_reduced.predict(X_test_reduced)
+
+    # Evaluate the model
+    mae_reduced = mean_absolute_error(y_test, y_pred_reduced)
+    mse_reduced = mean_squared_error(y_test, y_pred_reduced)
+
+    # Display performance metrics
+    print("Elastic Net Performance on Reduced Features:")
+    print(f"Mean Absolute Error (MAE): {mae_reduced:.4f}")
+    print(f"Mean Squared Error (MSE): {mse_reduced:.4f}")
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_test, y_pred_reduced, alpha=0.6)
+    plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], color='red', linestyle='--')
+    plt.xlabel("True Values")
+    plt.ylabel("Predicted Values")
+    plt.title("Elastic Net Predictions (Reduced Features) vs True Values")
+    plt.show()
+
+    return elastic_net_reduced, mae_reduced, mse_reduced, y_pred_reduced
